@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds a Kali arm64 root filesystem and merges in the kernel modules + firmware
-# from the postmarketOS image built by build-pmos.sh. Must run as root.
+# Builds a Kali arm64 root filesystem, merges in the kernel modules + firmware from the
+# postmarketOS image built by build-pmos.sh, and packs everything into ONE TWRP-flashable zip.
+# Must run as root.
 set -euxo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p work out
@@ -8,6 +9,7 @@ exec > >(tee -a work/kali.log) 2>&1
 TOOLS="${TOOLS:-kali-linux-core}"
 UI="${UI:-none}"
 ROOT="$PWD/work/kali-root"
+OUTZIP="$PWD/out/kali-a2corelte-twrp.zip"
 
 cleanup() {
   # kill daemons that apt postinst scripts started inside the chroot (they keep the mounts busy)
@@ -23,8 +25,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# tools for reading/writing Android sparse images and ext4 images
-apt-get install -y android-sdk-libsparse-utils e2fsprogs fdisk || true
+# tools for reading Android sparse images, building ext4 images and the zip
+apt-get install -y android-sdk-libsparse-utils e2fsprogs fdisk zip unzip || true
 
 rm -rf "$ROOT"
 curl -fsSL https://archive.kali.org/archive-keyring.gpg -o /usr/share/keyrings/kali-archive-keyring.gpg
@@ -105,10 +107,20 @@ ExecStart=/usr/local/sbin/usb-gadget.sh
 [Install]
 WantedBy=multi-user.target
 UNIT
+# first boot: grow the root filesystem to fill the whole partition it was flashed to
+cat > /etc/systemd/system/resize-root.service <<'RESIZE'
+[Unit]
+Description=Grow root filesystem to fill its partition (first boot only)
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'resize2fs "$(findmnt -n -o SOURCE /)" && systemctl disable resize-root.service'
+[Install]
+WantedBy=multi-user.target
+RESIZE
 mkdir -p /etc/dnsmasq.d /etc/NetworkManager/conf.d
 printf 'interface=usb0\nbind-dynamic\ndhcp-range=172.16.42.2,172.16.42.10,255.255.255.0,12h\n' > /etc/dnsmasq.d/usb.conf
 printf '[keyfile]\nunmanaged-devices=interface-name:usb0\n' > /etc/NetworkManager/conf.d/10-usb0.conf
-systemctl enable NetworkManager ssh usb-gadget.service dnsmasq || true
+systemctl enable NetworkManager ssh usb-gadget.service dnsmasq resize-root.service || true
 
 apt-get clean
 rm -rf /var/lib/apt/lists/* /setup.sh
@@ -160,21 +172,121 @@ ls "$ROOT/usr/lib/modules" || true
 
 rm -f "$ROOT/etc/resolv.conf" "$ROOT/usr/bin/qemu-aarch64-static"
 cleanup
-# nothing may be mounted inside the rootfs any more (otherwise tar would archive the host's /sys, /proc, /dev)
+# nothing may be mounted inside the rootfs any more (otherwise the image would contain the host's /sys, /proc, /dev)
 findmnt -R "$ROOT" || true
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev"
-tar -C "$ROOT" --numeric-owner --xattrs --one-file-system \
-  --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' \
-  -cpf - . | pigz -6 > out/kali-rootfs.tar.gz
 
-# ---- flashable image: ext4 labelled pmOS_root (what pmOS' initramfs looks for), as Android sparse ----
-# Flash it like the pmOS rootfs: heimdall flash --USERDATA kali-rootfs-sparse.img
-( set +e
-  USED=$(du -sm --apparent-size "$ROOT" | cut -f1)
-  SIZE=$(( USED * 125 / 100 + 400 ))
-  truncate -s "${SIZE}M" work/kali-root.img
-  mkfs.ext4 -F -q -L pmOS_root -d "$ROOT" work/kali-root.img \
-    && img2simg work/kali-root.img out/kali-rootfs-sparse.img \
-    && echo "built flashable sparse image (${SIZE} MB)"
-) || true
+# ---- raw ext4 image labelled pmOS_root (the label pmOS' initramfs looks for) ----
+USED=$(du -sm --apparent-size --one-file-system "$ROOT" | cut -f1)
+SIZE=$(( USED * 125 / 100 + 400 ))
+truncate -s "${SIZE}M" work/kali-root.img
+mkfs.ext4 -F -q -L pmOS_root -d "$ROOT" work/kali-root.img
+e2fsck -fn work/kali-root.img || true
+
+# ---- the TWRP-flashable zip ----
+Z=work/twrp
+rm -rf "$Z"
+mkdir -p "$Z/META-INF/com/google/android"
+echo "# dummy: update-binary is a shell script" > "$Z/META-INF/com/google/android/updater-script"
+cat > "$Z/META-INF/com/google/android/update-binary" <<'UPDATER'
+#!/sbin/sh
+# Kali Linux for Samsung Galaxy A2 Core - TWRP installer
+# Writes boot.img to BOOT and the Kali root filesystem to SYSTEM.
+OUTFD=/proc/self/fd/$2
+ZIPFILE="$3"
+
+ui_print() { echo "ui_print $1" > "$OUTFD"; echo "ui_print" > "$OUTFD"; }
+abort() { ui_print " "; ui_print "ERROR: $1"; ui_print "Aborting."; exit 1; }
+
+# find a partition node by name (Samsung uses upper case names)
+part() {
+  for n in "$1" "$(echo "$1" | tr 'A-Z' 'a-z')"; do
+    for d in /dev/block/platform/*/by-name /dev/block/by-name; do
+      if [ -e "$d/$n" ]; then readlink -f "$d/$n"; return 0; fi
+    done
+  done
+  return 1
+}
+# size in bytes of a block device
+size_of() {
+  b=$(basename "$1")
+  s=$(cat "/sys/class/block/$b/size" 2>/dev/null)
+  echo $(( ${s:-0} * 512 ))
+}
+# uncompressed size of a file inside the zip
+zip_size() { unzip -l "$ZIPFILE" "$1" 2>/dev/null | grep " $1\$" | awk '{print $1}'; }
+
+ui_print "======================================="
+ui_print "   Kali Linux  -  Galaxy A2 Core"
+ui_print "======================================="
+ui_print "Device: $(getprop ro.product.device)"
+
+BOOT=$(part BOOT) || abort "BOOT partition not found"
+SYS=$(part SYSTEM) || abort "SYSTEM partition not found"
+ui_print "BOOT   : $BOOT"
+ui_print "SYSTEM : $SYS"
+
+IMG_SZ=$(zip_size kali-root.img)
+BOOT_IMG_SZ=$(zip_size boot.img)
+SYS_SZ=$(size_of "$SYS")
+BOOT_SZ=$(size_of "$BOOT")
+[ -n "$IMG_SZ" ] && [ -n "$BOOT_IMG_SZ" ] || abort "zip is incomplete (kali-root.img / boot.img missing)"
+ui_print "rootfs image $((IMG_SZ/1048576)) MB -> SYSTEM $((SYS_SZ/1048576)) MB"
+ui_print "boot image   $((BOOT_IMG_SZ/1024)) KB -> BOOT   $((BOOT_SZ/1024)) KB"
+[ "$IMG_SZ" -le "$SYS_SZ" ] || abort "SYSTEM partition is too small for the Kali image"
+[ "$BOOT_IMG_SZ" -le "$BOOT_SZ" ] || abort "boot.img does not fit in the BOOT partition. Nothing was written."
+
+ZREAL=$(readlink -f "$ZIPFILE")
+case "$ZREAL" in
+  /system/*|/system_root/*) abort "Do not keep this zip on /system. Copy it to the SD card or /sdcard." ;;
+esac
+
+# back up the current boot image (so you can go back to Android)
+BK=""
+for d in /external_sd /sdcard1 /sdcard /tmp; do
+  if [ -d "$d" ] && [ -w "$d" ]; then BK="$d/Kali-backup"; break; fi
+done
+mkdir -p "$BK"
+dd if="$BOOT" of="$BK/boot-original.img" bs=1048576 2>/dev/null || abort "could not back up BOOT"
+ui_print "Backed up old BOOT to $BK/boot-original.img"
+[ "$BK" = "/tmp/Kali-backup" ] && ui_print "WARNING: backup is only in /tmp (lost on reboot) - no writable storage found"
+
+ui_print " "
+ui_print "Writing Kali root filesystem to SYSTEM (a few minutes)..."
+umount /system 2>/dev/null; umount /system_root 2>/dev/null; umount "$SYS" 2>/dev/null
+unzip -p "$ZIPFILE" kali-root.img | dd of="$SYS" bs=1048576 || abort "writing the rootfs failed - SYSTEM is now broken, re-flash this zip"
+sync
+blkid "$SYS" 2>/dev/null | grep -q pmOS_root || abort "rootfs verification failed (label pmOS_root not found) - re-flash this zip"
+ui_print "Root filesystem written."
+
+# grow the filesystem to fill the partition (best effort; Kali also does it on first boot)
+if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
+  e2fsck -fy "$SYS" >/dev/null 2>&1
+  resize2fs "$SYS" >/dev/null 2>&1 && ui_print "Filesystem grown to fill SYSTEM."
+fi
+
+ui_print "Writing boot image to BOOT..."
+unzip -o -q "$ZIPFILE" boot.img -d /tmp || abort "could not extract boot.img"
+dd if=/tmp/boot.img of="$BOOT" bs=1048576 || abort "writing BOOT failed - restore $BK/boot-original.img"
+sync
+A=$(md5sum /tmp/boot.img | cut -d' ' -f1)
+B=$(dd if="$BOOT" bs=1048576 count=$(( (BOOT_IMG_SZ + 1048575) / 1048576 )) 2>/dev/null | head -c "$BOOT_IMG_SZ" | md5sum | cut -d' ' -f1)
+rm -f /tmp/boot.img
+[ "$A" = "$B" ] || abort "BOOT verification failed - restore $BK/boot-original.img"
+ui_print "Boot image verified."
+
+ui_print " "
+ui_print "Done. Reboot to system."
+ui_print "First boot takes a while. Log in on the phone or over USB:"
+ui_print "  ssh kali@172.16.42.1   (user kali, password kali)"
+exit 0
+UPDATER
+chmod 755 "$Z/META-INF/com/google/android/update-binary"
+cp out/boot.img "$Z/boot.img"
+cp work/kali-root.img "$Z/kali-root.img"
+rm -f "$OUTZIP"
+( cd "$Z" && zip -q -r -9 "$OUTZIP" META-INF boot.img kali-root.img )
+unzip -l "$OUTZIP"
+# keep only the flashable zip in out/ (the workflow uploads out/*)
+mv out/boot.img work/boot.img.built
 ls -la out
