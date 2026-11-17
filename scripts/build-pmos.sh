@@ -18,13 +18,21 @@ python3 -m pip install --user --break-system-packages "$HOME/pmbootstrap" \
 pmbootstrap --version
 
 # pmaports (device + kernel packages) in pmbootstrap's default location
-PMAPORTS="$HOME/.local/var/pmbootstrap/cache_git/pmaports"
+WORK="$HOME/.local/var/pmbootstrap"
+PMAPORTS="$WORK/cache_git/pmaports"
 if [ ! -d "$PMAPORTS/.git" ]; then
   mkdir -p "$(dirname "$PMAPORTS")"
   git clone https://gitlab.postmarketos.org/postmarketOS/pmaports.git "$PMAPORTS"
 fi
 git -C "$PMAPORTS" remote -v
 git -C "$PMAPORTS" log --oneline -n 1
+
+# The work folder normally gets its "version" file from "pmbootstrap init".
+# We created it by hand (git clone above), so write the version file ourselves,
+# otherwise pmbootstrap says "work folder version needs to be migrated".
+WORKVER=$(python3 -c 'import pmb.config as c; print(c.work_version)' 2>/dev/null || echo 8)
+echo "work folder version: $WORKVER"
+echo "$WORKVER" > "$WORK/version"
 
 # pmbootstrap refuses to run (even "config") until a config file exists,
 # and "pmbootstrap init" is interactive -> write a minimal config ourselves.
@@ -54,6 +62,7 @@ restore_pkg() {
     echo "ERROR: $pkg is not in pmaports and was never deleted from it"
     return 1
   fi
+  git -C "$PMAPORTS" show --stat --format='%h %an %ad%n%B' "$c" | head -n 30
   p=$(git -C "$PMAPORTS" show --name-only --format= "$c" -- "device/*/$pkg/APKBUILD" | head -n1)
   d=$(dirname "$p")
   git -C "$PMAPORTS" checkout "$c^" -- "$d"
