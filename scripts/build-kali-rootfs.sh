@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Builds a Kali arm64 root filesystem and merges in the kernel modules + firmware
+# from the postmarketOS image built by build-pmos.sh. Must run as root.
+set -euxo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p work out
+exec > >(tee -a work/kali.log) 2>&1
+TOOLS="${TOOLS:-kali-linux-core}"
+UI="${UI:-none}"
+ROOT="$PWD/work/kali-root"
+
+cleanup() {
+  umount -R "$ROOT/dev" "$ROOT/sys" "$ROOT/proc" 2>/dev/null || true
+  umount work/pmos-mnt 2>/dev/null || true
+  [ -n "${LOOP:-}" ] && losetup -d "$LOOP" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+rm -rf "$ROOT"
+curl -fsSL https://archive.kali.org/archive-keyring.gpg -o /usr/share/keyrings/kali-archive-keyring.gpg
+[ -e /usr/share/debootstrap/scripts/kali-rolling ] || ln -s sid /usr/share/debootstrap/scripts/kali-rolling
+
+debootstrap --arch=arm64 --variant=minbase \
+  --components=main,contrib,non-free,non-free-firmware \
+  --keyring=/usr/share/keyrings/kali-archive-keyring.gpg \
+  --include=systemd-sysv,dbus,udev,kmod,ca-certificates \
+  kali-rolling "$ROOT" http://http.kali.org/kali
+
+cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/" || true
+cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
+mount -t proc proc "$ROOT/proc"
+mount --rbind /sys "$ROOT/sys"
+mount --rbind /dev "$ROOT/dev"
+
+cat > "$ROOT/setup.sh" <<'SETUP'
+#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+echo kali-a2core > /etc/hostname
+echo "127.0.1.1 kali-a2core" >> /etc/hosts
+echo "LABEL=pmOS_root / ext4 defaults,noatime 0 1" > /etc/fstab
+
+apt-get update
+apt-get install -y --no-install-recommends network-manager wpasupplicant openssh-server \
+  iw iproute2 iputils-ping sudo nano less dnsmasq locales usbutils
+apt-get install -y firmware-brcm80211 bluez bluez-firmware || apt-get install -y bluez || true
+apt-get install -y ${TOOLS}
+if [ "${UI}" = "phosh" ]; then
+  apt-get install -y phosh phoc squeekboard foot || true
+  systemctl enable phosh.service || true
+fi
+
+useradd -m -s /bin/bash kali || true
+for g in sudo audio video plugdev netdev input dialout bluetooth; do
+  getent group "$g" >/dev/null && usermod -aG "$g" kali || true
+done
+echo 'kali:kali' | chpasswd
+echo 'root:kali' | chpasswd
+
+# USB networking so you can always ssh in (phone = 172.16.42.1, PC gets DHCP)
+cat > /usr/local/sbin/usb-gadget.sh <<'GADGET'
+#!/bin/sh
+modprobe libcomposite 2>/dev/null
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+G=/sys/kernel/config/usb_gadget/kali
+[ -d "$G" ] && exit 0
+mkdir -p "$G" && cd "$G"
+echo 0x18d1 > idVendor
+echo 0xd001 > idProduct
+mkdir -p strings/0x409
+echo kali-a2corelte > strings/0x409/serialnumber
+echo Kali > strings/0x409/manufacturer
+echo "Kali A2 Core" > strings/0x409/product
+mkdir -p configs/c.1/strings/0x409
+echo ecm > configs/c.1/strings/0x409/configuration
+mkdir -p functions/ecm.usb0
+ln -s functions/ecm.usb0 configs/c.1/
+echo "$(ls /sys/class/udc | head -n1)" > UDC
+ip addr add 172.16.42.1/24 dev usb0
+ip link set usb0 up
+GADGET
+chmod +x /usr/local/sbin/usb-gadget.sh
+cat > /etc/systemd/system/usb-gadget.service <<'UNIT'
+[Unit]
+Description=USB ethernet gadget
+Before=dnsmasq.service network.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb-gadget.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+mkdir -p /etc/dnsmasq.d /etc/NetworkManager/conf.d
+printf 'interface=usb0\nbind-dynamic\ndhcp-range=172.16.42.2,172.16.42.10,255.255.255.0,12h\n' > /etc/dnsmasq.d/usb.conf
+printf '[keyfile]\nunmanaged-devices=interface-name:usb0\n' > /etc/NetworkManager/conf.d/10-usb0.conf
+systemctl enable NetworkManager ssh usb-gadget.service dnsmasq || true
+
+apt-get clean
+rm -rf /var/lib/apt/lists/* /setup.sh
+SETUP
+chmod +x "$ROOT/setup.sh"
+chroot "$ROOT" env TOOLS="$TOOLS" UI="$UI" /setup.sh
+
+# ---- merge kernel modules + firmware from the postmarketOS image ----
+mkdir -p work/pmos-mnt
+LOOP=$(losetup -Pf --show work/pmos/rootfs.img)
+PART=$(blkid -L pmOS_root || true)
+mount -o ro "${PART:-$LOOP}" work/pmos-mnt
+for d in lib usr/lib; do
+  [ -d "work/pmos-mnt/$d/modules" ] && mkdir -p "$ROOT/usr/lib/modules" && cp -a "work/pmos-mnt/$d/modules/." "$ROOT/usr/lib/modules/"
+  [ -d "work/pmos-mnt/$d/firmware" ] && mkdir -p "$ROOT/usr/lib/firmware" && cp -an "work/pmos-mnt/$d/firmware/." "$ROOT/usr/lib/firmware/"
+done
+for d in etc/modules-load.d etc/modprobe.d; do
+  [ -d "work/pmos-mnt/$d" ] && mkdir -p "$ROOT/$d" && cp -an "work/pmos-mnt/$d/." "$ROOT/$d/"
+done
+for v in "$ROOT"/usr/lib/modules/*; do depmod -b "$ROOT" "$(basename "$v")"; done
+ls "$ROOT/usr/lib/modules"
+
+rm -f "$ROOT/etc/resolv.conf" "$ROOT/usr/bin/qemu-aarch64-static"
+cleanup
+tar -C "$ROOT" --numeric-owner --xattrs -cpf - . | pigz -6 > out/kali-rootfs.tar.gz
+ls -la out
