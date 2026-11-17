@@ -16,6 +16,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# tools for reading/writing Android sparse images and ext4 images
+apt-get install -y android-sdk-libsparse-utils e2fsprogs fdisk || true
+
 rm -rf "$ROOT"
 curl -fsSL https://archive.kali.org/archive-keyring.gpg -o /usr/share/keyrings/kali-archive-keyring.gpg
 [ -e /usr/share/debootstrap/scripts/kali-rolling ] || ln -s sid /usr/share/debootstrap/scripts/kali-rolling
@@ -107,20 +110,36 @@ chmod +x "$ROOT/setup.sh"
 chroot "$ROOT" env TOOLS="$TOOLS" UI="$UI" /setup.sh
 
 # ---- merge kernel modules + firmware from the postmarketOS image ----
-# The pmOS image is a whole-disk image (boot partition + root partition). Loop-device partition
-# nodes are not reliable on CI runners, so mount each partition by byte offset and keep the one
-# that is the root filesystem (has /etc).
+# pmbootstrap exports this phone's rootfs as an Android *sparse* ext4 image (flash_sparse=true,
+# flashed with heimdall), so it has no partition table. Convert it back to a raw image first.
+IMG=work/pmos/rootfs.img
+file "$IMG" || true
+if [ "$(head -c4 "$IMG" | od -An -tx1 | tr -d ' \n')" = "3aff26ed" ]; then
+  echo "pmOS rootfs is an Android sparse image -> simg2img"
+  simg2img "$IMG" work/pmos/rootfs.raw
+  IMG=work/pmos/rootfs.raw
+fi
+file "$IMG" || true
 mkdir -p work/pmos-mnt
-sfdisk -d work/pmos/rootfs.img || true
+sfdisk -d "$IMG" || true
 PMOS_OK=""
-while read -r START SIZE; do
-  if mount -o ro,loop,offset=$((START*512)),sizelimit=$((SIZE*512)) work/pmos/rootfs.img work/pmos-mnt 2>/dev/null; then
-    if [ -d work/pmos-mnt/etc ]; then PMOS_OK=1; break; fi
-    umount work/pmos-mnt
-  fi
-done < <(sfdisk -J work/pmos/rootfs.img | python3 -c 'import json,sys
-for p in json.load(sys.stdin)["partitiontable"]["partitions"]: print(p["start"], p["size"])')
-[ -n "$PMOS_OK" ] || { echo "ERROR: could not find the root partition in work/pmos/rootfs.img"; exit 1; }
+# 1) the image is a bare ext4 filesystem
+if mount -o ro,loop "$IMG" work/pmos-mnt 2>/dev/null; then
+  if [ -d work/pmos-mnt/etc ]; then PMOS_OK=1; else umount work/pmos-mnt; fi
+fi
+# 2) the image is a whole disk: mount each partition by byte offset, keep the one with /etc
+if [ -z "$PMOS_OK" ]; then
+  while read -r START SIZE; do
+    if mount -o ro,loop,offset=$((START*512)),sizelimit=$((SIZE*512)) "$IMG" work/pmos-mnt 2>/dev/null; then
+      if [ -d work/pmos-mnt/etc ]; then PMOS_OK=1; break; fi
+      umount work/pmos-mnt
+    fi
+  done < <(sfdisk -J "$IMG" 2>/dev/null | python3 -c 'import json,sys
+try:
+  for p in json.load(sys.stdin)["partitiontable"]["partitions"]: print(p["start"], p["size"])
+except Exception: pass')
+fi
+[ -n "$PMOS_OK" ] || { echo "ERROR: could not mount the pmOS rootfs image"; exit 1; }
 ls work/pmos-mnt
 for d in lib usr/lib; do
   [ -d "work/pmos-mnt/$d/modules" ] && mkdir -p "$ROOT/usr/lib/modules" && cp -a "work/pmos-mnt/$d/modules/." "$ROOT/usr/lib/modules/"
@@ -129,10 +148,21 @@ done
 for d in etc/modules-load.d etc/modprobe.d; do
   [ -d "work/pmos-mnt/$d" ] && mkdir -p "$ROOT/$d" && cp -an "work/pmos-mnt/$d/." "$ROOT/$d/"
 done
-for v in "$ROOT"/usr/lib/modules/*; do depmod -b "$ROOT" "$(basename "$v")"; done
-ls "$ROOT/usr/lib/modules"
+for v in "$ROOT"/usr/lib/modules/*; do [ -d "$v" ] && depmod -b "$ROOT" "$(basename "$v")"; done
+ls "$ROOT/usr/lib/modules" || true
 
 rm -f "$ROOT/etc/resolv.conf" "$ROOT/usr/bin/qemu-aarch64-static"
 cleanup
 tar -C "$ROOT" --numeric-owner --xattrs -cpf - . | pigz -6 > out/kali-rootfs.tar.gz
+
+# ---- flashable image: ext4 labelled pmOS_root (what pmOS' initramfs looks for), as Android sparse ----
+# Flash it like the pmOS rootfs: heimdall flash --USERDATA kali-rootfs-sparse.img
+( set +e
+  USED=$(du -sm --apparent-size "$ROOT" | cut -f1)
+  SIZE=$(( USED * 125 / 100 + 400 ))
+  truncate -s "${SIZE}M" work/kali-root.img
+  mkfs.ext4 -F -q -L pmOS_root -d "$ROOT" work/kali-root.img \
+    && img2simg work/kali-root.img out/kali-rootfs-sparse.img \
+    && echo "built flashable sparse image (${SIZE} MB)"
+) || true
 ls -la out
