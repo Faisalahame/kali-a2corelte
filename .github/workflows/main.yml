@@ -1,0 +1,42 @@
+name: build-kali-a2corelte
+on:
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: "Kali metapackage (kali-linux-core, kali-tools-top10, kali-linux-headless)"
+        default: "kali-linux-core"
+      ui:
+        description: "none or phosh (phosh is experimental, heavy for 864 MB RAM)"
+        default: "none"
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support debootstrap e2fsprogs pigz curl git xz-utils kmod
+      - name: Build boot image (postmarketOS mainline kernel + initramfs)
+        run: bash scripts/build-pmos.sh
+      - name: Build Kali rootfs
+        env:
+          TOOLS: ${{ inputs.tools }}
+          UI: ${{ inputs.ui }}
+        run: sudo -E bash scripts/build-kali-rootfs.sh
+      - name: Show build errors
+        if: failure()
+        run: |
+          for f in work/*.log; do
+            echo "::error title=$f::$(tail -n 25 "$f" | tr '\n' '|' | cut -c1-3500)"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kali-a2corelte
+          path: out/*
+          compression-level: 0
