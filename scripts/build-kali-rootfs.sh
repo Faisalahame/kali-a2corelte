@@ -40,7 +40,11 @@ echo kali-a2core > /etc/hostname
 echo "127.0.1.1 kali-a2core" >> /etc/hosts
 echo "LABEL=pmOS_root / ext4 defaults,noatime 0 1" > /etc/fstab
 
-apt-get update
+# The keyring downloaded on the host lacks Kali's newest signing key, so the first
+# "apt-get update" can't verify the repo. Install the current keyring package first.
+apt-get update || true
+apt-get install -y kali-archive-keyring || true
+apt-get update || true
 apt-get install -y --no-install-recommends network-manager wpasupplicant openssh-server \
   iw iproute2 iputils-ping sudo nano less dnsmasq locales usbutils
 apt-get install -y firmware-brcm80211 bluez bluez-firmware || apt-get install -y bluez || true
@@ -103,10 +107,21 @@ chmod +x "$ROOT/setup.sh"
 chroot "$ROOT" env TOOLS="$TOOLS" UI="$UI" /setup.sh
 
 # ---- merge kernel modules + firmware from the postmarketOS image ----
+# The pmOS image is a whole-disk image (boot partition + root partition). Loop-device partition
+# nodes are not reliable on CI runners, so mount each partition by byte offset and keep the one
+# that is the root filesystem (has /etc).
 mkdir -p work/pmos-mnt
-LOOP=$(losetup -Pf --show work/pmos/rootfs.img)
-PART=$(blkid -L pmOS_root || true)
-mount -o ro "${PART:-$LOOP}" work/pmos-mnt
+sfdisk -d work/pmos/rootfs.img || true
+PMOS_OK=""
+while read -r START SIZE; do
+  if mount -o ro,loop,offset=$((START*512)),sizelimit=$((SIZE*512)) work/pmos/rootfs.img work/pmos-mnt 2>/dev/null; then
+    if [ -d work/pmos-mnt/etc ]; then PMOS_OK=1; break; fi
+    umount work/pmos-mnt
+  fi
+done < <(sfdisk -J work/pmos/rootfs.img | python3 -c 'import json,sys
+for p in json.load(sys.stdin)["partitiontable"]["partitions"]: print(p["start"], p["size"])')
+[ -n "$PMOS_OK" ] || { echo "ERROR: could not find the root partition in work/pmos/rootfs.img"; exit 1; }
+ls work/pmos-mnt
 for d in lib usr/lib; do
   [ -d "work/pmos-mnt/$d/modules" ] && mkdir -p "$ROOT/usr/lib/modules" && cp -a "work/pmos-mnt/$d/modules/." "$ROOT/usr/lib/modules/"
   [ -d "work/pmos-mnt/$d/firmware" ] && mkdir -p "$ROOT/usr/lib/firmware" && cp -an "work/pmos-mnt/$d/firmware/." "$ROOT/usr/lib/firmware/"
