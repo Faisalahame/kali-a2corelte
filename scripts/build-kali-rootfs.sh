@@ -10,7 +10,14 @@ UI="${UI:-none}"
 ROOT="$PWD/work/kali-root"
 
 cleanup() {
-  umount -R "$ROOT/dev" "$ROOT/sys" "$ROOT/proc" 2>/dev/null || true
+  # kill daemons that apt postinst scripts started inside the chroot (they keep the mounts busy)
+  for p in /proc/[0-9]*; do
+    r=$(readlink "$p/root" 2>/dev/null || true)
+    case "$r" in "$ROOT"|"$ROOT"/*) kill -9 "${p#/proc/}" 2>/dev/null || true ;; esac
+  done
+  sleep 1
+  # unmount each bind mount separately and lazily, otherwise "busy" mounts stay mounted
+  for m in dev sys proc; do umount -R -l "$ROOT/$m" 2>/dev/null || true; done
   umount work/pmos-mnt 2>/dev/null || true
   [ -n "${LOOP:-}" ] && losetup -d "$LOOP" 2>/dev/null || true
 }
@@ -153,7 +160,12 @@ ls "$ROOT/usr/lib/modules" || true
 
 rm -f "$ROOT/etc/resolv.conf" "$ROOT/usr/bin/qemu-aarch64-static"
 cleanup
-tar -C "$ROOT" --numeric-owner --xattrs -cpf - . | pigz -6 > out/kali-rootfs.tar.gz
+# nothing may be mounted inside the rootfs any more (otherwise tar would archive the host's /sys, /proc, /dev)
+findmnt -R "$ROOT" || true
+mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev"
+tar -C "$ROOT" --numeric-owner --xattrs --one-file-system \
+  --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' \
+  -cpf - . | pigz -6 > out/kali-rootfs.tar.gz
 
 # ---- flashable image: ext4 labelled pmOS_root (what pmOS' initramfs looks for), as Android sparse ----
 # Flash it like the pmOS rootfs: heimdall flash --USERDATA kali-rootfs-sparse.img
