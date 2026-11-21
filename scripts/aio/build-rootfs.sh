@@ -23,17 +23,45 @@ trap cleanup EXIT
 
 apt-get install -y android-sdk-libsparse-utils e2fsprogs fdisk zip unzip || true
 
+# ---- make sure arm64 programs run inside a chroot (qemu-user, "F" = interpreter is loaded at registration) ----
+# The previous run died with "Failure trying to run: chroot ... /bin/true". pmbootstrap (build-pmos.sh) registers its own
+# qemu binfmt entry that points at a path inside ITS chroot, which does not exist inside ours. So remove every aarch64
+# entry and register our own one that uses the host's /usr/bin/qemu-aarch64-static.
+setup_binfmt() {
+  mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+  for e in /proc/sys/fs/binfmt_misc/*; do
+    case "$(basename "$e")" in
+      register|status) ;;
+      *aarch64*|*arm64*) echo "removing old binfmt entry $e:"; cat "$e" || true; echo -1 > "$e" || true ;;
+    esac
+  done
+  echo ':kali-aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64-static:OCF' \
+    > /proc/sys/fs/binfmt_misc/register
+  cat /proc/sys/fs/binfmt_misc/kali-aarch64
+}
+test -x /usr/bin/qemu-aarch64-static
+setup_binfmt
+
 rm -rf "$ROOT"
 curl -fsSL https://archive.kali.org/archive-keyring.gpg -o /usr/share/keyrings/kali-archive-keyring.gpg
 [ -e /usr/share/debootstrap/scripts/kali-rolling ] || ln -s sid /usr/share/debootstrap/scripts/kali-rolling
 
-debootstrap --arch=arm64 --variant=minbase \
+debootstrap_fail() {
+  set +x
+  echo "== debootstrap failed, last lines of its own log =="
+  tail -n 60 "$ROOT/debootstrap/debootstrap.log" 2>/dev/null | cut -c1-300 | tee work/debootstrap-tail.log || true
+  cp -f "$ROOT/debootstrap/debootstrap.log" work/debootstrap.log 2>/dev/null || true
+  exit 1
+}
+debootstrap --foreign --arch=arm64 --variant=minbase \
   --components=main,contrib,non-free,non-free-firmware \
   --keyring=/usr/share/keyrings/kali-archive-keyring.gpg \
   --include=systemd-sysv,dbus,udev,kmod,ca-certificates \
-  kali-rolling "$ROOT" http://http.kali.org/kali
+  kali-rolling "$ROOT" http://http.kali.org/kali || debootstrap_fail
+cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/"
+chroot "$ROOT" /bin/true || { echo "ERROR: cannot run arm64 programs in the chroot (binfmt/qemu problem)"; ls -la "$ROOT/bin/true" "$ROOT/usr/bin/qemu-aarch64-static" || true; debootstrap_fail; }
+chroot "$ROOT" /debootstrap/debootstrap --second-stage || debootstrap_fail
 
-cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/" || true
 cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
 mount -t proc proc "$ROOT/proc"
 mount --rbind /sys "$ROOT/sys"
@@ -61,7 +89,7 @@ apt-get install -y ${TOOLS}
 apt-get install -y --no-install-recommends \
   xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput xinit xauth openbox dbus-x11 \
   x11-xserver-utils tint2 onboard lxterminal pcmanfm
-for p in xterm network-manager-gnome fonts-dejavu-core adwaita-icon-theme; do
+for p in xterm network-manager-gnome fonts-dejavu-core adwaita-icon-theme dconf-gsettings-backend dconf-service; do
   apt-get install -y --no-install-recommends "$p" || echo "WARN: optional package $p not installed"
 done
 
@@ -127,13 +155,27 @@ RestartSec=5
 WantedBy=multi-user.target
 XEOF
 
+# ---------------- phone-style touch settings ----------------
 H=/home/kali
-install -d -o kali -g kali "$H/.config" "$H/.config/openbox" "$H/.config/tint2"
+install -d -o kali -g kali "$H/.config" "$H/.config/openbox" "$H/.config/tint2" "$H/.config/gtk-3.0"
+# big text/buttons for the 540x960 screen
+printf 'Xft.dpi: 160\nXcursor.size: 48\n' > "$H/.Xresources"
+printf '[Settings]\ngtk-font-name=Sans 11\ngtk-cursor-theme-size=48\ngtk-icon-theme-name=Adwaita\n' > "$H/.config/gtk-3.0/settings.ini"
+# Openbox: every window opens maximized (phone style), bigger title bars with a close button, bigger menus
+mkdir -p /etc/xdg/openbox
+cp /etc/xdg/openbox/rc.xml "$H/.config/openbox/rc.xml"
+sed -i 's#</applications>#  <application class="*"><maximized>yes</maximized></application>\n  </applications>#' "$H/.config/openbox/rc.xml"
+sed -i 's#<size>[0-9]\{1,2\}</size>#<size>13</size>#g' "$H/.config/openbox/rc.xml"
+grep -q '<maximized>yes</maximized>' "$H/.config/openbox/rc.xml" || echo "WARN: could not make windows open maximized"
 cat > "$H/.config/openbox/autostart" <<'XEOF'
+xrdb -merge "$HOME/.Xresources" &
 tint2 &
 nm-applet &
 onboard &
+# dock the on-screen keyboard at the bottom (the panel is at the top)
+( sleep 8; gsettings set org.onboard.window docking-enabled true; gsettings set org.onboard.window docking-edge bottom ) &
 XEOF
+# panel on TOP (the keyboard docks at the bottom): launchers, task list, tray, clock
 cat > "$H/.config/tint2/tint2rc" <<'XEOF'
 rounded = 0
 border_width = 0
@@ -148,16 +190,16 @@ border_width = 0
 background_color = #606060 100
 border_color = #000000 0
 panel_items = LTSC
-panel_size = 100% 64
-panel_position = bottom center horizontal
+panel_size = 100% 72
+panel_position = top center horizontal
 panel_margin = 0 0
 panel_padding = 4 4 4
 panel_background_id = 1
 panel_layer = top
 wm_menu = 1
-launcher_padding = 4 4 6
+launcher_padding = 4 4 8
 launcher_background_id = 0
-launcher_icon_size = 48
+launcher_icon_size = 56
 launcher_item_app = /usr/share/applications/lxterminal.desktop
 launcher_item_app = /usr/share/applications/pcmanfm.desktop
 launcher_item_app = /usr/share/applications/onboard.desktop
@@ -166,20 +208,20 @@ taskbar_padding = 2 2 2
 taskbar_background_id = 0
 task_text = 0
 task_icon = 1
-task_maximum_size = 64 48
-task_padding = 4 4
+task_maximum_size = 72 56
+task_padding = 6 6
 task_background_id = 2
 task_active_background_id = 3
 systray_padding = 4 4 4
 systray_background_id = 0
-systray_icon_size = 40
+systray_icon_size = 48
 time1_format = %H:%M
-time1_font = Sans 14
+time1_font = Sans 16
 clock_font_color = #ffffff 100
 clock_padding = 6 0
 clock_background_id = 0
 XEOF
-chown -R kali:kali "$H/.config"
+chown -R kali:kali "$H/.config" "$H/.Xresources"
 
 # ---------------- USB networking so you can always ssh in (phone = 172.16.42.1) ----------------
 cat > /usr/local/sbin/usb-gadget.sh <<'GADGET'
@@ -230,6 +272,8 @@ RESIZE
 mkdir -p /etc/dnsmasq.d /etc/NetworkManager/conf.d
 printf 'interface=usb0\nbind-dynamic\ndhcp-range=172.16.42.2,172.16.42.10,255.255.255.0,12h\n' > /etc/dnsmasq.d/usb.conf
 printf '[keyfile]\nunmanaged-devices=interface-name:usb0\n' > /etc/NetworkManager/conf.d/10-usb0.conf
+# let nm-applet change Wi-Fi from the touch screen without a polkit agent
+printf '[main]\nauth-polkit=false\n' > /etc/NetworkManager/conf.d/20-no-polkit.conf
 systemctl enable NetworkManager ssh dnsmasq || true
 systemctl enable usb-gadget.service resize-root.service kali-gui.service
 systemctl set-default multi-user.target
@@ -245,7 +289,8 @@ for p in e2fsprogs xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input
   chroot "$ROOT" dpkg -s "$p" 2>/dev/null | grep -q '^Status: install ok installed' || { echo "ERROR: package $p is not installed"; exit 1; }
 done
 for f in /usr/bin/Xorg /usr/bin/openbox-session /usr/bin/tint2 /usr/bin/onboard /usr/sbin/resize2fs /usr/sbin/mkfs.ext4 \
-         /usr/lib/xorg/modules/drivers/fbdev_drv.so /usr/local/bin/kali-session /etc/systemd/system/kali-gui.service; do
+         /usr/lib/xorg/modules/drivers/fbdev_drv.so /usr/local/bin/kali-session /etc/systemd/system/kali-gui.service \
+         /home/kali/.config/openbox/rc.xml /home/kali/.Xresources; do
   [ -e "$ROOT$f" ] || { echo "ERROR: $f is missing"; exit 1; }
 done
 chroot "$ROOT" /usr/bin/Xorg -version 2>&1 | head -3 || true
