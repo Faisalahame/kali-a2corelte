@@ -1,11 +1,15 @@
 #!/sbin/sh
-# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-5)
+# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-6)
 # Writes the Kali root filesystem (touch desktop included) to the INTERNAL STORAGE (USERDATA) and boot.img to BOOT.
 # Send it with "adb sideload kali-a2corelte-aio.zip" (TWRP: Advanced -> ADB Sideload). SYSTEM is not touched.
 # Nothing is written until every check on the zip has passed. There is no backup step.
 # aio-4/5: the recovery shell does 32-bit math, so sizes in BYTES over 2 GB wrapped around (the root image showed as
 #          -1975 MB, the internal storage as 828 MB, and the read-back check got empty data). Everything is now counted in
 #          KB (fits easily). awk is only used to print a number, never for a yes/no test (that failed in aio-4).
+# aio-6:   boot.img ends with the 16 bytes "SEANDROIDENFORCE" after the page-aligned data, so its size is NOT a whole
+#          number of KB. aio-5 read back only the whole KBs (the last 16 bytes were missing) and reported
+#          "BOOT verification failed" although BOOT had been written correctly. BOOT is now checked by exact BYTES
+#          (the boot image is only ~32 MB, so byte counts are safe in the shell).
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
@@ -34,6 +38,10 @@ md5_kb() {
     dd if="$1" bs=1024 count="$2" 2>/dev/null | md5sum | cut -d' ' -f1
   fi
 }
+# md5 of exactly the first $2 BYTES of $1 (only for small sizes: $2 must stay far below 2 GB)
+md5_bytes() {
+  dd if="$1" bs=1024 count=$(( ($2 + 1023) / 1024 )) 2>/dev/null | head -c "$2" | md5sum | cut -d' ' -f1
+}
 mf() {
   if [ -n "$2" ]; then echo "$MF" | awk -v k="$1" -v n="$2" '$1==k && $2==n {print $3; exit}'
   else echo "$MF" | awk -v k="$1" '$1==k {print $2; exit}'; fi
@@ -41,7 +49,7 @@ mf() {
 
 ui_print "======================================================"
 ui_print "  Kali Linux - Galaxy A2 Core - installs to internal storage"
-ui_print "  installer aio-5"
+ui_print "  installer aio-6"
 ui_print "======================================================"
 DEV=$(getprop ro.product.device)
 [ -n "$DEV" ] || DEV=$(getprop ro.build.product)
@@ -75,16 +83,23 @@ MF=$(unzip -p "$ZIPFILE" kali.manifest 2>/dev/null)
 BOOT_IMG_B=$(mf boot_size); IMG_B=$(mf root_size); NCH=$(mf chunks)
 BOOT_MD5=$(mf md5 boot); ROOT_MD5=$(mf md5 root)
 [ -n "$BOOT_IMG_B" ] && [ -n "$IMG_B" ] && [ -n "$NCH" ] && [ -n "$BOOT_MD5" ] && [ -n "$ROOT_MD5" ] || abort "zip manifest is damaged. Nothing was written."
-BOOT_IMG_KB=$(kb "$BOOT_IMG_B"); IMG_KB=$(kb "$IMG_B")
+# the boot image is ~32 MB: at most 9 digits, so its byte count is safe for the shell's 32-bit math
+[ "${#BOOT_IMG_B}" -le 9 ] || abort "boot image size in the manifest is not valid. Nothing was written."
+BOOT_IMG_KB=$(( (BOOT_IMG_B + 1023) / 1024 )); IMG_KB=$(kb "$IMG_B")
 ui_print "rootfs image $((IMG_KB/1024)) MB -> internal storage $((UD_KB/1024)) MB (grown to full size on first boot)"
-ui_print "boot image   $BOOT_IMG_KB KB -> BOOT $BOOT_KB KB"
+ui_print "boot image   $BOOT_IMG_B bytes -> BOOT $BOOT_KB KB"
 [ "$IMG_KB" -gt 0 ] && [ "$IMG_KB" -le "$UD_KB" ] || abort "internal storage is too small for the Kali image"
 [ "$BOOT_IMG_KB" -gt 0 ] && [ "$BOOT_IMG_KB" -le "$BOOT_KB" ] || abort "boot.img does not fit in the BOOT partition. Nothing was written."
 
-# the read-back check must work BEFORE anything is erased: test it on the BOOT partition, whose md5 we can compare with itself
+# the read-back checks must work BEFORE anything is erased: test them on the BOOT partition, whose md5 we can compare with itself
 ui_print "Testing the read-back check on BOOT..."
 T1=$(md5_kb "$BOOT" "$BOOT_KB"); T2=$(md5_kb "$BOOT" "$BOOT_KB")
 [ "$T1" = "$T2" ] && [ "$T1" != "d41d8cd98f00b204e9800998ecf8427e" ] || abort "cannot read the BOOT partition back (md5 $T1 / $T2). Nothing was written."
+# the exact-bytes check (head -c) must work too, otherwise BOOT could not be verified after writing it
+HC=$(dd if=/dev/zero bs=1024 count=2 2>/dev/null | head -c 1500 | wc -c)
+[ "$(( HC + 0 ))" -eq 1500 ] || abort "this recovery's 'head -c' does not work, BOOT could not be verified. Nothing was written."
+B1=$(md5_bytes "$BOOT" "$BOOT_IMG_B"); B2=$(md5_bytes "$BOOT" "$BOOT_IMG_B")
+[ "$B1" = "$B2" ] && [ "$B1" != "d41d8cd98f00b204e9800998ecf8427e" ] || abort "cannot read the BOOT partition back by bytes (md5 $B1 / $B2). Nothing was written."
 
 ui_print "Checking the zip (a few minutes)..."
 got=$(unzip -p "$ZIPFILE" boot.img 2>/dev/null | md5sum | cut -d' ' -f1)
@@ -143,8 +158,14 @@ ui_print "Root filesystem written and verified."
 ui_print "Writing boot image to BOOT..."
 unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || abort "writing BOOT failed - re-flash this zip"
 sync
-GOT=$(md5_kb "$BOOT" "$BOOT_IMG_KB")
-[ "$BOOT_MD5" = "$GOT" ] || abort "BOOT verification failed - re-flash this zip"
+GOT=$(md5_bytes "$BOOT" "$BOOT_IMG_B")
+if [ "$BOOT_MD5" != "$GOT" ]; then
+  ui_print "BOOT md5 (exact $BOOT_IMG_B bytes): $GOT"
+  ui_print "boot.img md5 in the zip           : $BOOT_MD5"
+  ui_print "phone BOOT first MB md5: $(md5_kb "$BOOT" 1024)"
+  ui_print "zip   boot.img first MB md5: $(unzip -p "$ZIPFILE" boot.img 2>/dev/null | dd bs=1048576 count=1 2>/dev/null | md5sum | cut -d' ' -f1)"
+  abort "BOOT verification failed - re-flash this zip"
+fi
 ui_print "Boot image verified."
 
 ui_print " "
