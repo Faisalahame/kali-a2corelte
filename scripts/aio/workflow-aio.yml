@@ -1,0 +1,66 @@
+name: build-kali-aio
+# Builds ONE TWRP-flashable zip: Kali Linux + touch desktop + on-screen keyboard, installed to the INTERNAL storage.
+# Starts by itself when scripts/aio/** or this file change on main, or run it by hand (Actions tab -> Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: "Kali metapackage (kali-linux-core, kali-linux-headless, kali-tools-top10)"
+        default: "kali-linux-core"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aio.yml"
+      - "scripts/aio/**"
+concurrency:
+  group: kali-aio
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo apt-get clean
+          df -h /
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support debootstrap e2fsprogs pigz curl git xz-utils kmod \
+            zstd lz4 bzip2 binutils zip unzip android-sdk-libsparse-utils fdisk python3
+      - name: Build boot image base (postmarketOS mainline kernel + initramfs)
+        run: bash scripts/build-pmos.sh
+      - name: Build Kali rootfs with the touch desktop
+        env:
+          TOOLS: ${{ inputs.tools || 'kali-linux-core' }}
+        run: sudo -E bash scripts/aio/build-rootfs.sh
+      - name: Make the Samsung boot image (raw kernel, tiny initramfs)
+        run: python3 scripts/aio/make-boot.py out/boot.img scripts/aio/initramfs-init work/boot-kali.img 2>&1 | tee work/make-boot.log
+      - name: Make the flashable zip
+        run: |
+          python3 scripts/aio/make-zip.py out/kali-a2corelte-aio.zip work/boot-kali.img work/kali-root.img scripts/aio/update-binary.sh 2>&1 | tee work/make-zip.log
+          ls -la out
+          sha256sum out/kali-a2corelte-aio.zip | tee out/kali-a2corelte-aio.zip.sha256
+      - name: Show build errors
+        if: failure()
+        run: |
+          for f in work/*.log; do
+            echo "::error title=$f::$(tail -n 25 "$f" | tr '\n' '|' | cut -c1-3500)"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kali-a2corelte-aio
+          path: |
+            out/kali-a2corelte-aio.zip
+            out/kali-a2corelte-aio.zip.sha256
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kali-aio-logs
+          path: |
+            work/*.log
+          if-no-files-found: ignore
