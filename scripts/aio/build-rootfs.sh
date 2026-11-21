@@ -23,6 +23,17 @@ trap cleanup EXIT
 
 apt-get install -y android-sdk-libsparse-utils e2fsprogs fdisk zip unzip || true
 
+# ---- STEP 1: the Samsung boot.img, BEFORE anything slow. It only needs the pmOS kernel (out/boot.img from build-pmos.sh),
+# so if it is broken or does not fit the 32 MB BOOT partition we stop here, after seconds, instead of after an hour. ----
+echo "== step 1: Samsung boot.img =="
+python3 scripts/aio/make-boot.py out/boot.img scripts/aio/initramfs-init work/boot-kali.img 2>&1 | tee work/make-boot.log
+[ -s work/boot-kali.img ] || { echo "ERROR: boot.img was not made"; exit 1; }
+# this script runs as root; hand the file back so the later workflow step (runs as the normal user) can rewrite it
+chown "${SUDO_UID:-0}:${SUDO_GID:-0}" work/boot-kali.img work/make-boot.log 2>/dev/null || true
+ls -la work/boot-kali.img
+sha256sum work/boot-kali.img
+echo "== boot.img is done, now the Kali root filesystem =="
+
 # ---- make sure arm64 programs run inside a chroot (qemu-user, "F" = interpreter is loaded at registration) ----
 # The previous run died with "Failure trying to run: chroot ... /bin/true". pmbootstrap (build-pmos.sh) registers its own
 # qemu binfmt entry that points at a path inside ITS chroot, which does not exist inside ours. So remove every aarch64
