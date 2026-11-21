@@ -89,7 +89,8 @@ apt-get install -y ${TOOLS}
 apt-get install -y --no-install-recommends \
   xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput xinit xauth openbox dbus-x11 \
   x11-xserver-utils tint2 onboard lxterminal pcmanfm
-for p in xterm network-manager-gnome fonts-dejavu-core adwaita-icon-theme dconf-gsettings-backend dconf-service; do
+# Kali renamed network-manager-gnome to network-manager-applet (it provides nm-applet), so try the new name first
+for p in xterm network-manager-applet nm-connection-editor network-manager-gnome fonts-dejavu-core adwaita-icon-theme dconf-gsettings-backend dconf-service; do
   apt-get install -y --no-install-recommends "$p" || echo "WARN: optional package $p not installed"
 done
 
@@ -294,9 +295,16 @@ for f in /usr/bin/Xorg /usr/bin/openbox-session /usr/bin/tint2 /usr/bin/onboard 
   [ -e "$ROOT$f" ] || { echo "ERROR: $f is missing"; exit 1; }
 done
 chroot "$ROOT" /usr/bin/Xorg -version 2>&1 | head -3 || true
+# systemctl enable makes ABSOLUTE symlinks (-> /etc/systemd/system/x.service). Seen from the host those point at the HOST's
+# /etc, so "-e" says "missing" even though the link is fine inside the phone. Test the link itself (-L), and resolve it
+# inside the chroot for the real check.
 for u in kali-gui resize-root usb-gadget; do
-  [ -e "$ROOT/etc/systemd/system/multi-user.target.wants/$u.service" ] || { echo "ERROR: $u.service is not enabled"; exit 1; }
+  W="/etc/systemd/system/multi-user.target.wants/$u.service"
+  [ -L "$ROOT$W" ] || { echo "ERROR: $u.service is not enabled"; ls -la "$ROOT/etc/systemd/system/multi-user.target.wants/" || true; exit 1; }
+  chroot "$ROOT" test -e "$W" || { echo "ERROR: $u.service link points at nothing inside the root"; exit 1; }
 done
+# nm-applet is the Wi-Fi icon: warn (not fail) if no package supplied it
+[ -e "$ROOT/usr/bin/nm-applet" ] || echo "WARN: nm-applet is missing, so no Wi-Fi icon in the panel (use nmtui or nmcli)"
 
 # ---- merge kernel modules + firmware from the postmarketOS image ----
 IMG=work/pmos/rootfs.img
