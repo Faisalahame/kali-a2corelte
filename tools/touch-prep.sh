@@ -3,6 +3,9 @@
 #  1. makes the touchscreen + i2c bus drivers load at every boot (/etc/modules-load.d/touch.conf)
 #  2. adds a one-shot service that, 45 s after boot, writes everything about the touch chip to /var/log/touch-debug.txt
 # Nothing else on the phone is changed. Read the result later from TWRP: /k/var/log/touch-debug.txt
+# (v2: TWRP's shell needs a temp dir for the here-documents below, otherwise it fails with "can't create temporary file")
+mkdir -p /tmp
+export TMPDIR=/tmp
 umount /sdcard 2>/dev/null; umount /data/media 2>/dev/null; umount /data 2>/dev/null; umount /k 2>/dev/null
 mkdir -p /k
 mount -t ext4 -o rw /dev/block/mmcblk0p26 /k || { echo "mount failed"; grep mmcblk0p26 /proc/mounts; exit 1; }
@@ -15,9 +18,11 @@ cat > /k/usr/local/sbin/touch-debug.sh <<'EOF'
 #!/bin/sh
 sleep 45
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
+dmesg > /var/log/dmesg-full.txt 2>&1
 {
 echo "== date"; date
 echo "== uname"; uname -a
+echo "== cmdline"; cat /proc/cmdline
 echo "== lsmod"; lsmod
 echo "== input devices"; cat /proc/bus/input/devices
 echo "== i2c devices"; ls -la /sys/bus/i2c/devices/
@@ -45,6 +50,10 @@ ExecStart=/usr/local/sbin/touch-debug.sh
 WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/touch-debug.service /k/etc/systemd/system/multi-user.target.wants/touch-debug.service
+# check that every file really exists before leaving
+for f in /k/etc/modules-load.d/touch.conf /k/usr/local/sbin/touch-debug.sh /k/etc/systemd/system/touch-debug.service; do
+  [ -s "$f" ] || { echo "ERROR: $f was not written"; sync; umount /k; exit 1; }
+done
 sync
 umount /k
-echo "done - now reboot to system, wait 2 minutes, come back to TWRP"
+echo "done, all 3 files written - now reboot to system, wait 2 minutes, come back to TWRP"
