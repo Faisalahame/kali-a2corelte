@@ -1,16 +1,21 @@
 #!/sbin/sh
-# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-3)
+# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-4)
 # Writes the Kali root filesystem (touch desktop included) to the INTERNAL STORAGE (USERDATA) and boot.img to BOOT.
-# The zip must NOT be on the internal storage (it is erased): put it on the microSD card, OR send it with
-# "adb sideload kali-a2corelte-aio.zip" (TWRP: Advanced -> ADB Sideload). SYSTEM is not touched.
-# Nothing is written until every check has passed and the old BOOT is backed up.
-# aio-2: read-back checks no longer use "head -c" (it returned nothing in TWRP, so the md5 was that of empty data).
-# aio-3: adb sideload works. The backup of the old BOOT goes to the microSD card if there is one.
+# Send it with "adb sideload kali-a2corelte-aio.zip" (TWRP: Advanced -> ADB Sideload). SYSTEM is not touched.
+# Nothing is written until every check on the zip has passed. There is no backup step.
+# aio-4: the recovery shell does 32-bit math, so sizes over 2 GB wrapped around (the root image showed as -1975 MB, the
+#        internal storage as 828 MB, and the read-back check got empty data). All size math is now done with awk.
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
 ui_print() { echo "ui_print $1" > "$OUTFD"; echo "ui_print" > "$OUTFD"; }
 abort() { ui_print " "; ui_print "ERROR: $1"; ui_print "Aborting."; exit 1; }
+
+# ---- number helpers: awk uses 64-bit floating point, the shell here only has 32-bit integers ----
+ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
+le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 <= b+0)}'; }
+mb() { awk -v a="$1" 'BEGIN{printf "%.0f", a/1048576}'; }
+kb() { awk -v a="$1" 'BEGIN{printf "%.0f", a/1024}'; }
 
 part() {
   for n in "$1" "$(echo "$1" | tr 'A-Z' 'a-z')"; do
@@ -20,25 +25,18 @@ part() {
   done
   return 1
 }
-size_of() { b=$(basename "$1"); s=$(cat "/sys/class/block/$b/size" 2>/dev/null); echo $(( ${s:-0} * 512 )); }
+# size of a block device in bytes (sectors * 512, computed by awk)
+size_of() { b=$(basename "$1"); awk -v s="$(cat "/sys/class/block/$b/size" 2>/dev/null)" 'BEGIN{printf "%.0f", s*512}'; }
 file_size() { ls -l "$1" 2>/dev/null | awk '{print $5}'; }
-free_kb() { df -P "$1" 2>/dev/null | tail -1 | awk '{print $4}'; }
-# the microSD card, mounted and writable (used for the BOOT backup when the zip came through adb sideload)
-find_sd() {
-  for d in /external_sd /sdcard1 /ext_sd /external_sdcard /storage/sdcard1; do
-    grep -q " $d " /proc/mounts 2>/dev/null || mount "$d" 2>/dev/null
-    if grep -q " $d " /proc/mounts 2>/dev/null && [ -w "$d" ]; then echo "$d"; return 0; fi
-  done
-  return 1
-}
-# md5 of exactly the first $2 bytes of $1, using only dd + md5sum (like the older installer that verified fine here).
+# md5 of exactly the first $2 bytes of $1, using only dd + md5sum.
 # The block size is the biggest one that divides the byte count, so no partial block is needed.
 md5_exact() {
   mx_dev="$1"; mx_sz="$2"
   for mx_bs in 1048576 32768 4096 512 16 1; do
-    [ $((mx_sz % mx_bs)) -eq 0 ] && break
+    mx_cnt=$(awk -v s="$mx_sz" -v b="$mx_bs" 'BEGIN{ if (s % b == 0) printf "%.0f", s/b }')
+    [ -n "$mx_cnt" ] && break
   done
-  dd if="$mx_dev" bs=$mx_bs count=$((mx_sz / mx_bs)) 2>/dev/null | md5sum | cut -d' ' -f1
+  dd if="$mx_dev" bs=$mx_bs count=$mx_cnt 2>/dev/null | md5sum | cut -d' ' -f1
 }
 mf() {
   if [ -n "$2" ]; then echo "$MF" | awk -v k="$1" -v n="$2" '$1==k && $2==n {print $3; exit}'
@@ -47,7 +45,7 @@ mf() {
 
 ui_print "======================================================"
 ui_print "  Kali Linux - Galaxy A2 Core - installs to internal storage"
-ui_print "  installer aio-3"
+ui_print "  installer aio-4"
 ui_print "======================================================"
 DEV=$(getprop ro.product.device)
 [ -n "$DEV" ] || DEV=$(getprop ro.build.product)
@@ -61,53 +59,29 @@ ui_print "INTERNAL : $UD"
 [ "$BOOT" != "$UD" ] || abort "BOOT and USERDATA resolve to the same device"
 UD_SZ=$(size_of "$UD")
 BOOT_SZ=$(size_of "$BOOT")
-[ "$BOOT_SZ" -ge 8388608 ] && [ "$BOOT_SZ" -le 134217728 ] || abort "BOOT partition has an unexpected size, not writing anything"
-[ "$UD_SZ" -ge 4294967296 ] || abort "internal storage partition is smaller than 4 GB, not writing anything"
+ge "$BOOT_SZ" 8388608 && le "$BOOT_SZ" 134217728 || abort "BOOT partition has an unexpected size ($BOOT_SZ bytes), not writing anything"
+ge "$UD_SZ" 4294967296 || abort "internal storage partition is smaller than 4 GB ($UD_SZ bytes), not writing anything"
 
-# where is the zip? On the microSD card, or streamed from the computer by adb sideload (/sideload, /tmp).
-# It must NOT be on the internal storage (it is erased by this install).
+# the zip must come through adb sideload: if it were on the internal storage it would be erased by this install
 ZREAL=$(readlink -f "$ZIPFILE")
 [ -n "$ZREAL" ] || ZREAL="$ZIPFILE"
-ZDEV=$(df -P "$ZREAL" 2>/dev/null | tail -1 | awk '{print $1}')
-STREAM=0
 case "$ZREAL" in
-  /sideload/*|/tmp/*) STREAM=1 ;;
-  /data/*|/sdcard/*|/system/*|/system_root/*)
-    abort "this zip is on the phone's internal storage, which this install erases. Copy it to the microSD card, or use adb sideload." ;;
+  /data/*|/sdcard/*|/system/*|/system_root/*) abort "this zip is on the phone's internal storage, which this install erases. Use adb sideload." ;;
 esac
-if [ "$STREAM" = "0" ]; then
-  [ "$ZDEV" != "$UD" ] || abort "this zip is on the internal storage, which this install erases. Copy it to the microSD card, or use adb sideload."
-  case "$ZDEV" in /dev/block/mmcblk0*) abort "this zip is on the phone's internal memory. Copy it to the microSD card, or use adb sideload." ;; esac
-fi
+ZDEV=$(df -P "$ZREAL" 2>/dev/null | tail -1 | awk '{print $1}')
+[ "$ZDEV" != "$UD" ] || abort "this zip is on the internal storage, which this install erases. Use adb sideload."
 ZSIZE=$(file_size "$ZIPFILE")
-[ -n "$ZSIZE" ] && [ "$ZSIZE" -gt 1048576 ] || abort "cannot read the zip file"
-
-BK=""
-if [ "$STREAM" = "1" ]; then
-  ui_print "Zip comes through adb sideload (streamed from your computer)."
-  ZDIR=$(find_sd) || ZDIR=""
-  if [ -n "$ZDIR" ]; then ui_print "microSD card found at $ZDIR (used for the BOOT backup)"
-  else ui_print "No microSD card found: the old BOOT cannot be backed up (only OK if BOOT already holds Kali)."; fi
-else
-  ZDIR=$(dirname "$ZREAL")
-  [ -d "$ZDIR" ] && [ -w "$ZDIR" ] || abort "the folder of the zip is not writable ($ZDIR)"
-fi
-if [ -n "$ZDIR" ]; then
-  FREE=$(free_kb "$ZDIR")
-  [ -n "$FREE" ] && [ "$FREE" -gt 70000 ] 2>/dev/null || abort "less than 70 MB free on the SD card (needed for the BOOT backup)"
-  BK="$ZDIR/Kali-backup"
-  mkdir -p "$BK" || abort "cannot create $BK. Nothing was written."
-fi
+[ -n "$ZSIZE" ] && ge "$ZSIZE" 1048576 || abort "cannot read the zip file"
 
 MF=$(unzip -p "$ZIPFILE" kali.manifest 2>/dev/null)
 [ -n "$MF" ] || abort "zip is incomplete or unreadable (manifest missing). Nothing was written."
 BOOT_IMG_SZ=$(mf boot_size); IMG_SZ=$(mf root_size); NCH=$(mf chunks)
 BOOT_MD5=$(mf md5 boot); ROOT_MD5=$(mf md5 root)
 [ -n "$BOOT_IMG_SZ" ] && [ -n "$IMG_SZ" ] && [ -n "$NCH" ] && [ -n "$BOOT_MD5" ] && [ -n "$ROOT_MD5" ] || abort "zip manifest is damaged. Nothing was written."
-ui_print "rootfs image $((IMG_SZ/1048576)) MB -> internal storage $((UD_SZ/1048576)) MB (grown to full size on first boot)"
-ui_print "boot image   $((BOOT_IMG_SZ/1024)) KB -> BOOT $((BOOT_SZ/1024)) KB"
-[ "$IMG_SZ" -le "$UD_SZ" ] || abort "internal storage is too small for the Kali image"
-[ "$BOOT_IMG_SZ" -le "$BOOT_SZ" ] || abort "boot.img does not fit in the BOOT partition. Nothing was written."
+ui_print "rootfs image $(mb "$IMG_SZ") MB -> internal storage $(mb "$UD_SZ") MB (grown to full size on first boot)"
+ui_print "boot image   $(kb "$BOOT_IMG_SZ") KB -> BOOT $(kb "$BOOT_SZ") KB"
+le "$IMG_SZ" "$UD_SZ" || abort "internal storage is too small for the Kali image"
+le "$BOOT_IMG_SZ" "$BOOT_SZ" || abort "boot.img does not fit in the BOOT partition. Nothing was written."
 
 # the read-back check must work BEFORE anything is erased: test it on the BOOT partition, whose md5 we can compare with itself
 ui_print "Testing the read-back check on BOOT..."
@@ -137,33 +111,6 @@ while [ "$i" -lt "$NCH" ]; do
   [ $((i % 4)) -eq 0 ] && ui_print "  checked $i of $NCH parts"
 done
 ui_print "Zip is intact."
-
-# optional Wi-Fi: a text file kali-wifi.txt on the microSD card next to the zip, or in the SD card's top folder
-# (line 1 = network name, line 2 = password)
-WIFI_SSID=""; WIFI_PSK=""
-WIFI_FILE=""
-[ -n "$ZDIR" ] && [ -f "$ZDIR/kali-wifi.txt" ] && WIFI_FILE="$ZDIR/kali-wifi.txt"
-if [ -n "$WIFI_FILE" ]; then
-  WIFI_SSID=$(sed -n 1p "$WIFI_FILE" | tr -d '\r')
-  WIFI_PSK=$(sed -n 2p "$WIFI_FILE" | tr -d '\r')
-  [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ] && ui_print "Found kali-wifi.txt: will set up Wi-Fi '$WIFI_SSID'"
-fi
-
-# back up the current boot image
-BOOT_IS_KALI=0
-dd if="$BOOT" bs=1048576 2>/dev/null | grep -q pmos_rootfsopts && BOOT_IS_KALI=1
-if [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && ! grep -q pmos_rootfsopts "$BK/boot-original.img"; then
-  ui_print "Keeping the existing backup $BK/boot-original.img"
-elif [ "$BOOT_IS_KALI" = "1" ]; then
-  ui_print "NOTE: BOOT already holds a Kali image, so there is no Android boot backup."
-elif [ -z "$BK" ]; then
-  abort "no microSD card to save the old BOOT image to. Put a microSD card in the phone and sideload again. Nothing was written."
-else
-  dd if="$BOOT" of="$BK/boot-original.img" bs=1048576 2>/dev/null || abort "could not back up BOOT. Nothing was written."
-  sync
-  [ "$(md5_exact "$BK/boot-original.img" "$BOOT_SZ")" = "$(md5_exact "$BOOT" "$BOOT_SZ")" ] || abort "BOOT backup does not match the partition. Nothing was written."
-  ui_print "Backed up old BOOT to $BK/boot-original.img (verified)"
-fi
 
 ui_print " "
 ui_print "ERASING the internal storage (Android data and photos) and writing Kali..."
@@ -195,46 +142,17 @@ if [ "$ROOT_MD5" != "$GOT" ]; then
 fi
 ui_print "Root filesystem written and verified."
 
-# optional Wi-Fi setup inside the new root
-if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
-  mkdir -p /tmp/kroot
-  if mount -t ext4 -o rw "$UD" /tmp/kroot 2>/dev/null; then
-    D=/tmp/kroot/etc/NetworkManager/system-connections
-    mkdir -p "$D"
-    {
-      echo "[connection]"; echo "id=hotspot"; echo "type=wifi"; echo "autoconnect=true"
-      echo "[wifi]"; echo "mode=infrastructure"; echo "ssid=$WIFI_SSID"
-      echo "[wifi-security]"; echo "key-mgmt=wpa-psk"; echo "psk=$WIFI_PSK"
-      echo "[ipv4]"; echo "method=auto"; echo "[ipv6]"; echo "method=auto"
-    } > "$D/hotspot.nmconnection"
-    chmod 600 "$D/hotspot.nmconnection"
-    sync; umount /tmp/kroot
-    ui_print "Wi-Fi '$WIFI_SSID' saved."
-  else
-    ui_print "Could not mount the new root to save Wi-Fi (not fatal): choose Wi-Fi on the phone screen instead."
-  fi
-fi
-
 ui_print "Writing boot image to BOOT..."
-unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || {
-  ui_print "Writing BOOT failed - restoring the old boot image..."
-  [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
-  abort "writing BOOT failed. Old boot image: ${BK:-none saved}/boot-original.img"
-}
+unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || abort "writing BOOT failed - re-flash this zip"
 sync
 GOT=$(md5_exact "$BOOT" "$BOOT_IMG_SZ")
-if [ "$BOOT_MD5" != "$GOT" ]; then
-  ui_print "BOOT verification failed - restoring the old boot image..."
-  [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
-  sync
-  abort "BOOT verification failed. Old boot image: ${BK:-none saved}/boot-original.img"
-fi
+[ "$BOOT_MD5" = "$GOT" ] || abort "BOOT verification failed - re-flash this zip"
 ui_print "Boot image verified."
 
 ui_print " "
 ui_print "Done. Reboot to system (TWRP may say 'Failed to mount /data': normal)."
 ui_print "First boot takes a few minutes (it grows the filesystem to the whole"
 ui_print "internal storage, then the touch desktop appears)."
-ui_print "Login: kali / kali (change it with passwd). SSH over Wi-Fi or USB 172.16.42.1."
+ui_print "Login: kali / kali (change it with passwd). SSH over USB 172.16.42.1."
 ui_print "Do NOT use TWRP Wipe/Format Data afterwards: Kali lives there now."
 exit 0
