@@ -1,20 +1,18 @@
 #!/sbin/sh
-# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-4)
+# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-5)
 # Writes the Kali root filesystem (touch desktop included) to the INTERNAL STORAGE (USERDATA) and boot.img to BOOT.
 # Send it with "adb sideload kali-a2corelte-aio.zip" (TWRP: Advanced -> ADB Sideload). SYSTEM is not touched.
 # Nothing is written until every check on the zip has passed. There is no backup step.
-# aio-4: the recovery shell does 32-bit math, so sizes over 2 GB wrapped around (the root image showed as -1975 MB, the
-#        internal storage as 828 MB, and the read-back check got empty data). All size math is now done with awk.
+# aio-4/5: the recovery shell does 32-bit math, so sizes in BYTES over 2 GB wrapped around (the root image showed as
+#          -1975 MB, the internal storage as 828 MB, and the read-back check got empty data). Everything is now counted in
+#          KB (fits easily). awk is only used to print a number, never for a yes/no test (that failed in aio-4).
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
 ui_print() { echo "ui_print $1" > "$OUTFD"; echo "ui_print" > "$OUTFD"; }
 abort() { ui_print " "; ui_print "ERROR: $1"; ui_print "Aborting."; exit 1; }
 
-# ---- number helpers: awk uses 64-bit floating point, the shell here only has 32-bit integers ----
-ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
-le() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 <= b+0)}'; }
-mb() { awk -v a="$1" 'BEGIN{printf "%.0f", a/1048576}'; }
+# ---- number helper: bytes (can be over 2 GB, so only awk may touch them) -> KB (small enough for the shell) ----
 kb() { awk -v a="$1" 'BEGIN{printf "%.0f", a/1024}'; }
 
 part() {
@@ -25,18 +23,16 @@ part() {
   done
   return 1
 }
-# size of a block device in bytes (sectors * 512, computed by awk)
-size_of() { b=$(basename "$1"); awk -v s="$(cat "/sys/class/block/$b/size" 2>/dev/null)" 'BEGIN{printf "%.0f", s*512}'; }
-file_size() { ls -l "$1" 2>/dev/null | awk '{print $5}'; }
-# md5 of exactly the first $2 bytes of $1, using only dd + md5sum.
-# The block size is the biggest one that divides the byte count, so no partial block is needed.
-md5_exact() {
-  mx_dev="$1"; mx_sz="$2"
-  for mx_bs in 1048576 32768 4096 512 16 1; do
-    mx_cnt=$(awk -v s="$mx_sz" -v b="$mx_bs" 'BEGIN{ if (s % b == 0) printf "%.0f", s/b }')
-    [ -n "$mx_cnt" ] && break
-  done
-  dd if="$mx_dev" bs=$mx_bs count=$mx_cnt 2>/dev/null | md5sum | cut -d' ' -f1
+# size of a block device in KB (the kernel reports 512-byte sectors)
+size_kb() { b=$(basename "$1"); s=$(cat "/sys/class/block/$b/size" 2>/dev/null); echo $(( ${s:-0} / 2 )); }
+file_kb() { kb "$(ls -l "$1" 2>/dev/null | awk '{print $5}')"; }
+# md5 of exactly the first $2 KB of $1, using only dd + md5sum (1 MB blocks when the size allows it)
+md5_kb() {
+  if [ $(( $2 % 1024 )) -eq 0 ]; then
+    dd if="$1" bs=1048576 count=$(( $2 / 1024 )) 2>/dev/null | md5sum | cut -d' ' -f1
+  else
+    dd if="$1" bs=1024 count="$2" 2>/dev/null | md5sum | cut -d' ' -f1
+  fi
 }
 mf() {
   if [ -n "$2" ]; then echo "$MF" | awk -v k="$1" -v n="$2" '$1==k && $2==n {print $3; exit}'
@@ -45,7 +41,7 @@ mf() {
 
 ui_print "======================================================"
 ui_print "  Kali Linux - Galaxy A2 Core - installs to internal storage"
-ui_print "  installer aio-4"
+ui_print "  installer aio-5"
 ui_print "======================================================"
 DEV=$(getprop ro.product.device)
 [ -n "$DEV" ] || DEV=$(getprop ro.build.product)
@@ -57,10 +53,11 @@ UD=$(part USERDATA) || UD=$(part DATA) || abort "USERDATA (internal storage) par
 ui_print "BOOT     : $BOOT"
 ui_print "INTERNAL : $UD"
 [ "$BOOT" != "$UD" ] || abort "BOOT and USERDATA resolve to the same device"
-UD_SZ=$(size_of "$UD")
-BOOT_SZ=$(size_of "$BOOT")
-ge "$BOOT_SZ" 8388608 && le "$BOOT_SZ" 134217728 || abort "BOOT partition has an unexpected size ($BOOT_SZ bytes), not writing anything"
-ge "$UD_SZ" 4294967296 || abort "internal storage partition is smaller than 4 GB ($UD_SZ bytes), not writing anything"
+UD_KB=$(size_kb "$UD")
+BOOT_KB=$(size_kb "$BOOT")
+ui_print "sizes: BOOT $BOOT_KB KB, INTERNAL $UD_KB KB"
+[ "$BOOT_KB" -ge 8192 ] && [ "$BOOT_KB" -le 131072 ] || abort "BOOT partition has an unexpected size ($BOOT_KB KB), not writing anything"
+[ "$UD_KB" -ge 4194304 ] || abort "internal storage partition is smaller than 4 GB ($UD_KB KB), not writing anything"
 
 # the zip must come through adb sideload: if it were on the internal storage it would be erased by this install
 ZREAL=$(readlink -f "$ZIPFILE")
@@ -70,22 +67,23 @@ case "$ZREAL" in
 esac
 ZDEV=$(df -P "$ZREAL" 2>/dev/null | tail -1 | awk '{print $1}')
 [ "$ZDEV" != "$UD" ] || abort "this zip is on the internal storage, which this install erases. Use adb sideload."
-ZSIZE=$(file_size "$ZIPFILE")
-[ -n "$ZSIZE" ] && ge "$ZSIZE" 1048576 || abort "cannot read the zip file"
+ZIP_KB=$(file_kb "$ZIPFILE")
+[ -n "$ZIP_KB" ] && [ "$ZIP_KB" -ge 1024 ] || abort "cannot read the zip file"
 
 MF=$(unzip -p "$ZIPFILE" kali.manifest 2>/dev/null)
 [ -n "$MF" ] || abort "zip is incomplete or unreadable (manifest missing). Nothing was written."
-BOOT_IMG_SZ=$(mf boot_size); IMG_SZ=$(mf root_size); NCH=$(mf chunks)
+BOOT_IMG_B=$(mf boot_size); IMG_B=$(mf root_size); NCH=$(mf chunks)
 BOOT_MD5=$(mf md5 boot); ROOT_MD5=$(mf md5 root)
-[ -n "$BOOT_IMG_SZ" ] && [ -n "$IMG_SZ" ] && [ -n "$NCH" ] && [ -n "$BOOT_MD5" ] && [ -n "$ROOT_MD5" ] || abort "zip manifest is damaged. Nothing was written."
-ui_print "rootfs image $(mb "$IMG_SZ") MB -> internal storage $(mb "$UD_SZ") MB (grown to full size on first boot)"
-ui_print "boot image   $(kb "$BOOT_IMG_SZ") KB -> BOOT $(kb "$BOOT_SZ") KB"
-le "$IMG_SZ" "$UD_SZ" || abort "internal storage is too small for the Kali image"
-le "$BOOT_IMG_SZ" "$BOOT_SZ" || abort "boot.img does not fit in the BOOT partition. Nothing was written."
+[ -n "$BOOT_IMG_B" ] && [ -n "$IMG_B" ] && [ -n "$NCH" ] && [ -n "$BOOT_MD5" ] && [ -n "$ROOT_MD5" ] || abort "zip manifest is damaged. Nothing was written."
+BOOT_IMG_KB=$(kb "$BOOT_IMG_B"); IMG_KB=$(kb "$IMG_B")
+ui_print "rootfs image $((IMG_KB/1024)) MB -> internal storage $((UD_KB/1024)) MB (grown to full size on first boot)"
+ui_print "boot image   $BOOT_IMG_KB KB -> BOOT $BOOT_KB KB"
+[ "$IMG_KB" -gt 0 ] && [ "$IMG_KB" -le "$UD_KB" ] || abort "internal storage is too small for the Kali image"
+[ "$BOOT_IMG_KB" -gt 0 ] && [ "$BOOT_IMG_KB" -le "$BOOT_KB" ] || abort "boot.img does not fit in the BOOT partition. Nothing was written."
 
 # the read-back check must work BEFORE anything is erased: test it on the BOOT partition, whose md5 we can compare with itself
 ui_print "Testing the read-back check on BOOT..."
-T1=$(md5_exact "$BOOT" "$BOOT_SZ"); T2=$(md5_exact "$BOOT" "$BOOT_SZ")
+T1=$(md5_kb "$BOOT" "$BOOT_KB"); T2=$(md5_kb "$BOOT" "$BOOT_KB")
 [ "$T1" = "$T2" ] && [ "$T1" != "d41d8cd98f00b204e9800998ecf8427e" ] || abort "cannot read the BOOT partition back (md5 $T1 / $T2). Nothing was written."
 
 ui_print "Checking the zip (a few minutes)..."
@@ -132,7 +130,7 @@ if [ -e /tmp/unz-failed ] || [ "$DDRC" -ne 0 ]; then
   abort "writing the rootfs failed - the internal storage is now broken, re-flash this zip"
 fi
 ui_print "Verifying..."
-GOT=$(md5_exact "$UD" "$IMG_SZ")
+GOT=$(md5_kb "$UD" "$IMG_KB")
 if [ "$ROOT_MD5" != "$GOT" ]; then
   # help find out what went wrong: compare the first MB on the phone with the first MB of the zip
   ui_print "read-back bytes (first 1 MB test): $(dd if="$UD" bs=32768 count=32 2>/dev/null | wc -c)"
@@ -145,7 +143,7 @@ ui_print "Root filesystem written and verified."
 ui_print "Writing boot image to BOOT..."
 unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || abort "writing BOOT failed - re-flash this zip"
 sync
-GOT=$(md5_exact "$BOOT" "$BOOT_IMG_SZ")
+GOT=$(md5_kb "$BOOT" "$BOOT_IMG_KB")
 [ "$BOOT_MD5" = "$GOT" ] || abort "BOOT verification failed - re-flash this zip"
 ui_print "Boot image verified."
 
