@@ -1,8 +1,9 @@
 #!/sbin/sh
-# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-1)
+# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-2)
 # Writes the Kali root filesystem (touch desktop included) to the INTERNAL STORAGE (USERDATA) and boot.img to BOOT.
 # The zip must be on the microSD card, because USERDATA is erased. SYSTEM is not touched.
 # Nothing is written until every check has passed and the old BOOT is backed up.
+# aio-2: read-back checks no longer use "head -c" (it returned nothing in TWRP, so the md5 was that of empty data).
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
@@ -20,7 +21,15 @@ part() {
 size_of() { b=$(basename "$1"); s=$(cat "/sys/class/block/$b/size" 2>/dev/null); echo $(( ${s:-0} * 512 )); }
 file_size() { ls -l "$1" 2>/dev/null | awk '{print $5}'; }
 free_kb() { df -P "$1" 2>/dev/null | tail -1 | awk '{print $4}'; }
-md5_head() { dd if="$1" bs=1048576 count=$(( ($2 + 1048575) / 1048576 )) 2>/dev/null | head -c "$2" | md5sum | cut -d' ' -f1; }
+# md5 of exactly the first $2 bytes of $1, using only dd + md5sum (like the older installer that verified fine here).
+# The block size is the biggest one that divides the byte count, so no partial block is needed.
+md5_exact() {
+  mx_dev="$1"; mx_sz="$2"
+  for mx_bs in 1048576 32768 4096 512 16 1; do
+    [ $((mx_sz % mx_bs)) -eq 0 ] && break
+  done
+  dd if="$mx_dev" bs=$mx_bs count=$((mx_sz / mx_bs)) 2>/dev/null | md5sum | cut -d' ' -f1
+}
 mf() {
   if [ -n "$2" ]; then echo "$MF" | awk -v k="$1" -v n="$2" '$1==k && $2==n {print $3; exit}'
   else echo "$MF" | awk -v k="$1" '$1==k {print $2; exit}'; fi
@@ -28,6 +37,7 @@ mf() {
 
 ui_print "======================================================"
 ui_print "  Kali Linux - Galaxy A2 Core - installs to internal storage"
+ui_print "  installer aio-2"
 ui_print "======================================================"
 DEV=$(getprop ro.product.device)
 [ -n "$DEV" ] || DEV=$(getprop ro.build.product)
@@ -72,6 +82,11 @@ ui_print "boot image   $((BOOT_IMG_SZ/1024)) KB -> BOOT $((BOOT_SZ/1024)) KB"
 [ "$IMG_SZ" -le "$UD_SZ" ] || abort "internal storage is too small for the Kali image"
 [ "$BOOT_IMG_SZ" -le "$BOOT_SZ" ] || abort "boot.img does not fit in the BOOT partition. Nothing was written."
 
+# the read-back check must work BEFORE anything is erased: test it on the BOOT partition, whose md5 we can compare with itself
+ui_print "Testing the read-back check on BOOT..."
+T1=$(md5_exact "$BOOT" "$BOOT_SZ"); T2=$(md5_exact "$BOOT" "$BOOT_SZ")
+[ "$T1" = "$T2" ] && [ "$T1" != "d41d8cd98f00b204e9800998ecf8427e" ] || abort "cannot read the BOOT partition back (md5 $T1 / $T2). Nothing was written."
+
 ui_print "Checking the zip (a few minutes)..."
 got=$(unzip -p "$ZIPFILE" boot.img 2>/dev/null | md5sum | cut -d' ' -f1)
 [ "$got" = "$BOOT_MD5" ] || abort "boot.img in the zip is bad (want $BOOT_MD5, got $got). Nothing was written."
@@ -114,7 +129,7 @@ elif [ "$BOOT_IS_KALI" = "1" ]; then
 else
   dd if="$BOOT" of="$BK/boot-original.img" bs=1048576 2>/dev/null || abort "could not back up BOOT. Nothing was written."
   sync
-  [ "$(md5_head "$BK/boot-original.img" "$BOOT_SZ")" = "$(md5_head "$BOOT" "$BOOT_SZ")" ] || abort "BOOT backup does not match the partition. Nothing was written."
+  [ "$(md5_exact "$BK/boot-original.img" "$BOOT_SZ")" = "$(md5_exact "$BOOT" "$BOOT_SZ")" ] || abort "BOOT backup does not match the partition. Nothing was written."
   ui_print "Backed up old BOOT to $BK/boot-original.img (verified)"
 fi
 
@@ -123,17 +138,29 @@ ui_print "ERASING the internal storage (Android data and photos) and writing Kal
 # release the internal storage
 umount /sdcard 2>/dev/null; umount /data/media 2>/dev/null; umount /data 2>/dev/null; umount "$UD" 2>/dev/null
 grep -q "^$UD " /proc/mounts && abort "cannot unmount the internal storage ($UD). Nothing was written."
+rm -f /tmp/unz-failed /tmp/dd-write.log
 (
   i=0
   while [ "$i" -lt "$NCH" ]; do
-    unzip -p "$ZIPFILE" "$(printf "root/c%02d.img" "$i")" || exit 1
+    unzip -p "$ZIPFILE" "$(printf "root/c%02d.img" "$i")" || { touch /tmp/unz-failed; exit 1; }
     i=$((i+1))
   done
-) | dd of="$UD" bs=1048576 2>/dev/null || abort "writing the rootfs failed - the internal storage is now broken, re-flash this zip"
+) | dd of="$UD" bs=1048576 2>/tmp/dd-write.log
+DDRC=$?
 sync
+if [ -e /tmp/unz-failed ] || [ "$DDRC" -ne 0 ]; then
+  ui_print "dd exit code $DDRC; $(tail -n 2 /tmp/dd-write.log 2>/dev/null | tr '\n' ' ')"
+  abort "writing the rootfs failed - the internal storage is now broken, re-flash this zip"
+fi
 ui_print "Verifying..."
-GOT=$(md5_head "$UD" "$IMG_SZ")
-[ "$ROOT_MD5" = "$GOT" ] || abort "rootfs verification failed (want $ROOT_MD5, got $GOT) - re-flash this zip"
+GOT=$(md5_exact "$UD" "$IMG_SZ")
+if [ "$ROOT_MD5" != "$GOT" ]; then
+  # help find out what went wrong: compare the first MB on the phone with the first MB of the zip
+  ui_print "read-back bytes (first 1 MB test): $(dd if="$UD" bs=32768 count=32 2>/dev/null | wc -c)"
+  ui_print "phone first MB md5: $(dd if="$UD" bs=32768 count=32 2>/dev/null | md5sum | cut -d' ' -f1)"
+  ui_print "zip   first MB md5: $(unzip -p "$ZIPFILE" root/c00.img 2>/dev/null | dd bs=32768 count=32 2>/dev/null | md5sum | cut -d' ' -f1)"
+  abort "rootfs verification failed (want $ROOT_MD5, got $GOT) - re-flash this zip"
+fi
 ui_print "Root filesystem written and verified."
 
 # optional Wi-Fi setup inside the new root
@@ -163,7 +190,7 @@ unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || {
   abort "writing BOOT failed. Old boot image: $BK/boot-original.img"
 }
 sync
-GOT=$(md5_head "$BOOT" "$BOOT_IMG_SZ")
+GOT=$(md5_exact "$BOOT" "$BOOT_IMG_SZ")
 if [ "$BOOT_MD5" != "$GOT" ]; then
   ui_print "BOOT verification failed - restoring the old boot image..."
   [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
