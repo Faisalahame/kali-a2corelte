@@ -1,9 +1,11 @@
 #!/sbin/sh
-# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-2)
+# Kali Linux for Samsung Galaxy A2 Core - all-in-one TWRP installer (aio-3)
 # Writes the Kali root filesystem (touch desktop included) to the INTERNAL STORAGE (USERDATA) and boot.img to BOOT.
-# The zip must be on the microSD card, because USERDATA is erased. SYSTEM is not touched.
+# The zip must NOT be on the internal storage (it is erased): put it on the microSD card, OR send it with
+# "adb sideload kali-a2corelte-aio.zip" (TWRP: Advanced -> ADB Sideload). SYSTEM is not touched.
 # Nothing is written until every check has passed and the old BOOT is backed up.
 # aio-2: read-back checks no longer use "head -c" (it returned nothing in TWRP, so the md5 was that of empty data).
+# aio-3: adb sideload works. The backup of the old BOOT goes to the microSD card if there is one.
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
 
@@ -21,6 +23,14 @@ part() {
 size_of() { b=$(basename "$1"); s=$(cat "/sys/class/block/$b/size" 2>/dev/null); echo $(( ${s:-0} * 512 )); }
 file_size() { ls -l "$1" 2>/dev/null | awk '{print $5}'; }
 free_kb() { df -P "$1" 2>/dev/null | tail -1 | awk '{print $4}'; }
+# the microSD card, mounted and writable (used for the BOOT backup when the zip came through adb sideload)
+find_sd() {
+  for d in /external_sd /sdcard1 /ext_sd /external_sdcard /storage/sdcard1; do
+    grep -q " $d " /proc/mounts 2>/dev/null || mount "$d" 2>/dev/null
+    if grep -q " $d " /proc/mounts 2>/dev/null && [ -w "$d" ]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
 # md5 of exactly the first $2 bytes of $1, using only dd + md5sum (like the older installer that verified fine here).
 # The block size is the biggest one that divides the byte count, so no partial block is needed.
 md5_exact() {
@@ -37,7 +47,7 @@ mf() {
 
 ui_print "======================================================"
 ui_print "  Kali Linux - Galaxy A2 Core - installs to internal storage"
-ui_print "  installer aio-2"
+ui_print "  installer aio-3"
 ui_print "======================================================"
 DEV=$(getprop ro.product.device)
 [ -n "$DEV" ] || DEV=$(getprop ro.build.product)
@@ -54,23 +64,40 @@ BOOT_SZ=$(size_of "$BOOT")
 [ "$BOOT_SZ" -ge 8388608 ] && [ "$BOOT_SZ" -le 134217728 ] || abort "BOOT partition has an unexpected size, not writing anything"
 [ "$UD_SZ" -ge 4294967296 ] || abort "internal storage partition is smaller than 4 GB, not writing anything"
 
-# the zip must NOT be on the internal storage (it is erased by this install)
+# where is the zip? On the microSD card, or streamed from the computer by adb sideload (/sideload, /tmp).
+# It must NOT be on the internal storage (it is erased by this install).
 ZREAL=$(readlink -f "$ZIPFILE")
+[ -n "$ZREAL" ] || ZREAL="$ZIPFILE"
 ZDEV=$(df -P "$ZREAL" 2>/dev/null | tail -1 | awk '{print $1}')
+STREAM=0
 case "$ZREAL" in
-  /data/*|/sdcard/*|/system/*|/system_root/*|/sideload/*|/tmp/*)
-    abort "this zip is on the phone's internal storage (or sideload), which this install erases. Copy it to the microSD card and install it from there." ;;
+  /sideload/*|/tmp/*) STREAM=1 ;;
+  /data/*|/sdcard/*|/system/*|/system_root/*)
+    abort "this zip is on the phone's internal storage, which this install erases. Copy it to the microSD card, or use adb sideload." ;;
 esac
-[ "$ZDEV" != "$UD" ] || abort "this zip is on the internal storage, which this install erases. Copy it to the microSD card."
-case "$ZDEV" in /dev/block/mmcblk0*) abort "this zip is on the phone's internal memory. Copy it to the microSD card." ;; esac
+if [ "$STREAM" = "0" ]; then
+  [ "$ZDEV" != "$UD" ] || abort "this zip is on the internal storage, which this install erases. Copy it to the microSD card, or use adb sideload."
+  case "$ZDEV" in /dev/block/mmcblk0*) abort "this zip is on the phone's internal memory. Copy it to the microSD card, or use adb sideload." ;; esac
+fi
 ZSIZE=$(file_size "$ZIPFILE")
 [ -n "$ZSIZE" ] && [ "$ZSIZE" -gt 1048576 ] || abort "cannot read the zip file"
-ZDIR=$(dirname "$ZREAL")
-[ -d "$ZDIR" ] && [ -w "$ZDIR" ] || abort "the folder of the zip is not writable ($ZDIR)"
-FREE=$(free_kb "$ZDIR")
-[ -n "$FREE" ] && [ "$FREE" -gt 70000 ] 2>/dev/null || abort "less than 70 MB free next to the zip on the SD card (needed for the BOOT backup)"
-BK="$ZDIR/Kali-backup"
-mkdir -p "$BK" || abort "cannot create $BK. Nothing was written."
+
+BK=""
+if [ "$STREAM" = "1" ]; then
+  ui_print "Zip comes through adb sideload (streamed from your computer)."
+  ZDIR=$(find_sd) || ZDIR=""
+  if [ -n "$ZDIR" ]; then ui_print "microSD card found at $ZDIR (used for the BOOT backup)"
+  else ui_print "No microSD card found: the old BOOT cannot be backed up (only OK if BOOT already holds Kali)."; fi
+else
+  ZDIR=$(dirname "$ZREAL")
+  [ -d "$ZDIR" ] && [ -w "$ZDIR" ] || abort "the folder of the zip is not writable ($ZDIR)"
+fi
+if [ -n "$ZDIR" ]; then
+  FREE=$(free_kb "$ZDIR")
+  [ -n "$FREE" ] && [ "$FREE" -gt 70000 ] 2>/dev/null || abort "less than 70 MB free on the SD card (needed for the BOOT backup)"
+  BK="$ZDIR/Kali-backup"
+  mkdir -p "$BK" || abort "cannot create $BK. Nothing was written."
+fi
 
 MF=$(unzip -p "$ZIPFILE" kali.manifest 2>/dev/null)
 [ -n "$MF" ] || abort "zip is incomplete or unreadable (manifest missing). Nothing was written."
@@ -111,21 +138,26 @@ while [ "$i" -lt "$NCH" ]; do
 done
 ui_print "Zip is intact."
 
-# optional Wi-Fi: a text file kali-wifi.txt next to the zip (line 1 = network name, line 2 = password)
+# optional Wi-Fi: a text file kali-wifi.txt on the microSD card next to the zip, or in the SD card's top folder
+# (line 1 = network name, line 2 = password)
 WIFI_SSID=""; WIFI_PSK=""
-if [ -f "$ZDIR/kali-wifi.txt" ]; then
-  WIFI_SSID=$(sed -n 1p "$ZDIR/kali-wifi.txt" | tr -d '\r')
-  WIFI_PSK=$(sed -n 2p "$ZDIR/kali-wifi.txt" | tr -d '\r')
+WIFI_FILE=""
+[ -n "$ZDIR" ] && [ -f "$ZDIR/kali-wifi.txt" ] && WIFI_FILE="$ZDIR/kali-wifi.txt"
+if [ -n "$WIFI_FILE" ]; then
+  WIFI_SSID=$(sed -n 1p "$WIFI_FILE" | tr -d '\r')
+  WIFI_PSK=$(sed -n 2p "$WIFI_FILE" | tr -d '\r')
   [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ] && ui_print "Found kali-wifi.txt: will set up Wi-Fi '$WIFI_SSID'"
 fi
 
 # back up the current boot image
 BOOT_IS_KALI=0
 dd if="$BOOT" bs=1048576 2>/dev/null | grep -q pmos_rootfsopts && BOOT_IS_KALI=1
-if [ -s "$BK/boot-original.img" ] && ! grep -q pmos_rootfsopts "$BK/boot-original.img"; then
+if [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && ! grep -q pmos_rootfsopts "$BK/boot-original.img"; then
   ui_print "Keeping the existing backup $BK/boot-original.img"
 elif [ "$BOOT_IS_KALI" = "1" ]; then
   ui_print "NOTE: BOOT already holds a Kali image, so there is no Android boot backup."
+elif [ -z "$BK" ]; then
+  abort "no microSD card to save the old BOOT image to. Put a microSD card in the phone and sideload again. Nothing was written."
 else
   dd if="$BOOT" of="$BK/boot-original.img" bs=1048576 2>/dev/null || abort "could not back up BOOT. Nothing was written."
   sync
@@ -186,16 +218,16 @@ fi
 ui_print "Writing boot image to BOOT..."
 unzip -p "$ZIPFILE" boot.img | dd of="$BOOT" bs=1048576 2>/dev/null || {
   ui_print "Writing BOOT failed - restoring the old boot image..."
-  [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
-  abort "writing BOOT failed. Old boot image: $BK/boot-original.img"
+  [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
+  abort "writing BOOT failed. Old boot image: ${BK:-none saved}/boot-original.img"
 }
 sync
 GOT=$(md5_exact "$BOOT" "$BOOT_IMG_SZ")
 if [ "$BOOT_MD5" != "$GOT" ]; then
   ui_print "BOOT verification failed - restoring the old boot image..."
-  [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
+  [ -n "$BK" ] && [ -s "$BK/boot-original.img" ] && dd if="$BK/boot-original.img" of="$BOOT" bs=1048576 2>/dev/null
   sync
-  abort "BOOT verification failed. Old boot image: $BK/boot-original.img"
+  abort "BOOT verification failed. Old boot image: ${BK:-none saved}/boot-original.img"
 fi
 ui_print "Boot image verified."
 
