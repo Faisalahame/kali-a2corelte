@@ -7,6 +7,8 @@
 # exynos7870 kernel) and copy the old a2corelte boot.img settings (offsets, page size, cmdline,
 # dtb, mkbootimg/dtbtool) from pmaports git history into it. That makes pmbootstrap produce
 # the same kind of boot.img the old a2corelte package produced.
+# The pmOS rootfs itself is NOT shipped: only its kernel modules, firmware and boot.img are used.
+# So the service manager inside it does not matter (see the OpenRC fallback below).
 set -euxo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p work/pmos out
@@ -116,7 +118,20 @@ if [ "$DEVICE" = samsung-exynos7 ]; then
 fi
 
 pmbootstrap config || true
-pmbootstrap -y install --password kali
+
+# First try the default (systemd on current pmaports). If installing the rootfs fails (the 2026-11-21 run died
+# in apk with "failed to commit usr/bin/udevadm / usr/sbin/init" from the systemd-edge repo), retry once with
+# OpenRC. We only take kernel modules, firmware and boot.img from this rootfs, so the service manager is irrelevant.
+if ! pmbootstrap -y install --password kali; then
+  echo "WARN: pmbootstrap install failed with the default service manager -> retrying with OpenRC"
+  cp -f "$WORK/log.txt" work/pmb-install-systemd-attempt.log 2>/dev/null || true
+  pmbootstrap -y zap || true
+  pmbootstrap -y config service_manager openrc \
+    || pmbootstrap -y config systemd never \
+    || echo "WARN: neither 'service_manager openrc' nor 'systemd never' was accepted by this pmbootstrap"
+  pmbootstrap config | grep -iE 'service_manager|systemd' || true
+  pmbootstrap -y install --password kali
+fi
 
 CH="$WORK/chroot_rootfs_$DEVICE"
 echo "== rootfs /boot =="
