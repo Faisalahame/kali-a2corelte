@@ -26,9 +26,21 @@ on_err() {
 }
 trap on_err ERR
 
+# gitlab.postmarketos.org sometimes answers 502 ("GitLab is not responding"): retry, then try the gitlab.com mirror
+clone_retry() {
+  local dest="$1" depth="$2" name="$3" u n
+  for u in "https://gitlab.postmarketos.org/postmarketOS/$name.git" "https://gitlab.com/postmarketOS/$name.git"; do
+    for n in 1 2 3 4 5; do
+      rm -rf "$dest"
+      if git clone ${depth:+--depth=1} "$u" "$dest"; then return 0; fi
+      echo "WARN: clone of $u failed (try $n/5), waiting"; sleep $((n*20))
+    done
+  done
+  echo "ERROR: could not clone $name from any server"; return 1
+}
+
 # pmbootstrap is no longer on PyPI (all versions yanked) -> install from git
-rm -rf "$HOME/pmbootstrap"
-git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git "$HOME/pmbootstrap"
+clone_retry "$HOME/pmbootstrap" 1 pmbootstrap
 mkdir -p "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
 python3 -m pip install --user --break-system-packages "$HOME/pmbootstrap" \
@@ -38,7 +50,7 @@ pmbootstrap --version
 # pmaports (device + kernel packages) in pmbootstrap's default location
 if [ ! -d "$PMAPORTS/.git" ]; then
   mkdir -p "$(dirname "$PMAPORTS")"
-  git clone https://gitlab.postmarketos.org/postmarketOS/pmaports.git "$PMAPORTS"
+  clone_retry "$PMAPORTS" "" pmaports
 fi
 git -C "$PMAPORTS" remote -v
 git -C "$PMAPORTS" log --oneline -n 1
